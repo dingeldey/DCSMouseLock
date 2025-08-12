@@ -1,3 +1,21 @@
+#!/usr/bin/env python3
+# Joystick/Throttle → Mouse Position Repeater (modifier, per-monitor, hold-adjust, recenter)
+# Single-thread, Windows-friendly (SendInput), pygame-based
+#
+# Features
+# - Lists all game controllers (index, GUID, buttons)
+# - GUID-first, index-second device selection
+# - Optional modifier button (same or second device); mark actions with 'M' (e.g., "25M")
+# - Choose target monitor; fractions (preferred) or pixels within that monitor
+# - Toggle ON/OFF; ON recenters to INI base each time; OFF does not restore cursor (configurable)
+# - Continuous hold-based adjust for X/Y at pixels/second velocity
+# - Reapply cursor every repeat_ms while active; optional 1px wiggle
+# - Debug prints for button edges with correct device index mapping
+# - Clamp target to selected monitor or full virtual desktop (configurable)
+#
+# Requires: pygame, pyautogui
+#   pip install pygame pyautogui
+
 import sys
 import time
 from pathlib import Path
@@ -198,6 +216,12 @@ def load_config(path: str):
     repeat_ms = max(1, sec.getint("repeat_ms", fallback=1000))
     nudge_velocity = max(1, sec.getint("nudge_velocity_px_s", fallback=600))
 
+    clamp_space = sec.get("clamp_space", "monitor").strip().lower()
+    if clamp_space not in ("monitor", "virtual"):
+        clamp_space = "monitor"
+
+    restore_on_off = getbool("restore_on_off", False)  # default: do NOT restore (per user request)
+
     return {
         "device_guid": device_guid, "device_index": device_index,
         "mod_guid": mod_guid, "mod_index": mod_index, "modifier_button": modifier_button,
@@ -216,6 +240,9 @@ def load_config(path: str):
         "toggle_feedback": getbool("toggle_feedback", True),
         "log_apply": getbool("log_apply", False),
         "debug_buttons": getbool("debug_buttons", False),
+        "clamp_space": clamp_space,
+        "clamp_virtual": (clamp_space == "virtual"),
+        "restore_on_off": restore_on_off,
     }
 
 def open_device_by_guid_or_index(guid: str, idx: int | None):
@@ -239,9 +266,20 @@ def event_matches_device(e, js) -> bool:
     except AttributeError: js_id = js.get_id()
     return ev_id == js_id
 
-def clamp_to_monitor(x, y, mon):
-    x = max(mon["x"], min(mon["x"] + mon["w"] - 1, x))
-    y = max(mon["y"], min(mon["y"] + mon["h"] - 1, y))
+def clamp_target(x, y, mon, clamp_virtual):
+    """Clamp to selected monitor (monitor) or whole virtual desktop (virtual)."""
+    if clamp_virtual:
+        if platform.system().lower() == "windows":
+            vx, vy, vw, vh = win_virtual_desktop_rect()
+            x = max(vx, min(vx + vw - 1, x))
+            y = max(vy, min(vy + vh - 1, y))
+        else:
+            sw, sh = pyautogui.size()
+            x = max(0, min(sw - 1, x))
+            y = max(0, min(sh - 1, y))
+    else:
+        x = max(mon["x"], min(mon["x"] + mon["w"] - 1, x))
+        y = max(mon["y"], min(mon["y"] + mon["h"] - 1, y))
     return x, y
 
 def main():
@@ -249,7 +287,7 @@ def main():
     init_pygame()
 
     print("===================================================")
-    print("  Joystick/Throttle → Mouse Position Repeater (hold-only adjust + recenter)")
+    print("  Joystick/Throttle → Mouse Position Repeater (modifier + hold-adjust + recenter)")
     print("===================================================\n")
 
     devices, inst_to_idx = list_devices(); print()
@@ -288,7 +326,7 @@ def main():
     else:
         base_x = int(mon["x"] + cfg["x"])
         base_y = int(mon["y"] + cfg["y"])
-    base_x, base_y = clamp_to_monitor(base_x, base_y, mon)
+    base_x, base_y = clamp_target(base_x, base_y, mon, cfg["clamp_virtual"])
 
     # Current (mutable) target
     target_x, target_y = base_x, base_y
@@ -296,7 +334,8 @@ def main():
     print(f"[OK] Using primary device: Index={inst_to_idx.get(instance_id,'?')}, GUID={guid}, Name='{name}'")
     print(f"[OK] Using monitor: MonIdx={mon['index']} ({'Primary' if mon['primary'] else 'Secondary'}) "
           f"x={mon['x']} y={mon['y']} w={mon['w']} h={mon['h']} Name='{mon['name']}'")
-    print(f"[OK] Base target from INI: ({base_x}, {base_y}) | repeat each {cfg['repeat_ms']} ms\n")
+    print(f"[OK] Base target from INI: ({base_x}, {base_y}) | repeat each {cfg['repeat_ms']} ms")
+    print(f"[OK] Clamp space: {'virtual desktop' if cfg['clamp_virtual'] else 'selected monitor'}\n")
 
     # State
     pygame.event.clear()
@@ -328,7 +367,7 @@ def main():
     def toggle_on():
         nonlocal active, saved_cursor, last_apply, wiggle_flip, target_x, target_y
         if active: return
-        # capture cursor for restore
+        # capture cursor for optional restore
         if platform.system().lower() == "windows":
             saved_cursor = get_cursor_pos_virtual()
         else:
@@ -343,8 +382,9 @@ def main():
         nonlocal active, last_apply, wiggle_flip
         if not active: return
         active = False
-        if cfg["toggle_feedback"]: print("[TOGGLE] INACTIVE (restoring)")
-        if False and saved_cursor is not None:
+        if cfg["toggle_feedback"]:
+            print("[TOGGLE] INACTIVE" + (" (restoring)" if cfg["restore_on_off"] else ""))
+        if cfg["restore_on_off"] and (saved_cursor is not None):
             x0, y0 = saved_cursor
             if cfg["use_sendinput"] and platform.system().lower() == "windows":
                 sendinput_move_absolute_virtual(x0, y0)
@@ -412,7 +452,7 @@ def main():
                 step_y = int(round(vy * cfg["nudge_velocity"] * dt))
                 if step_x != 0 or step_y != 0:
                     target_x += step_x; target_y += step_y
-                    target_x, target_y = clamp_to_monitor(target_x, target_y, mon)
+                    target_x, target_y = clamp_target(target_x, target_y, mon, cfg["clamp_virtual"])
                     if active:
                         apply_cursor(); last_apply = now; wiggle_flip = not wiggle_flip
 
